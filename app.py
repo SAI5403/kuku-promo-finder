@@ -1,4 +1,3 @@
-%%writefile app.py
 import streamlit as st
 import pandas as pd
 import json
@@ -6,9 +5,10 @@ import os
 import io
 import re
 import zipfile
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-# Optional Gemini client support
+# Optional Google GenAI SDK import
 try:
     from google import genai
     from google.genai import types
@@ -16,7 +16,7 @@ try:
 except ImportError:
     HAS_GENAI = False
 
-# Set Page Config
+# Set Page Configuration
 st.set_page_config(
     page_title="Kuku PromoAI — Microdrama Ad Finder",
     page_icon="🎬",
@@ -24,7 +24,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom High-End Styling
+# High-End Dark UI Styling
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
@@ -88,11 +88,78 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# STAGES 1 - 9 CORE PIPELINE (MATCHING main.ipynb)
+# PROMPT DEFINITIONS (FROM COLAB STAGES 4 & 5)
+# ==============================================================================
+
+SCENE_ANALYSIS_PROMPT = """You are an expert microdrama promo editor.
+
+Analyze the following screenplay scene.
+Identify:
+1. Main event
+2. Conflict
+3. Emotional intensity
+4. Surprise factor
+5. Mystery
+6. Hook potential (can the opening stop a viewer scrolling in 3 seconds?)
+7. Cliffhanger potential (does it end on an unresolved, high-stakes moment?)
+8. Whether the scene makes sense without prior episodes (standalone comprehensibility)
+
+Give integer or float scores from 0 to 10 for each score factor.
+Do not invent events that are not present in the screenplay.
+
+Return structured JSON only matching this schema:
+{
+  "main_event": "string",
+  "conflict": "string",
+  "emotion": "string",
+  "conflict_score": 0.0-10.0,
+  "surprise_score": 0.0-10.0,
+  "emotion_score": 0.0-10.0,
+  "mystery_score": 0.0-10.0,
+  "hook_score": 0.0-10.0,
+  "cliffhanger_score": 0.0-10.0,
+  "standalone_score": 0.0-10.0
+}
+
+SCENE:
+"""
+
+HOOK_CLIFFHANGER_PROMPT = """You are an expert microdrama promo editor.
+
+Analyze the following screenplay scene and identify candidate HOOKS and CLIFFHANGERS.
+Do not decide the final clip duration. Only identify the strongest moments and their exact timestamps.
+
+1. A HOOK is a shocking event or line in this scene that will stop a scrolling viewer in the first 3 seconds (e.g., slap, sudden arrest, shocking confession, gun pulled, betrayal reveal).
+2. A CLIFFHANGER is an unresolved high-stakes cut-point where the clip should end, leaving the viewer needing to see what happens next (e.g., interrupted confession, unanswered threat, character about to open a door or envelope, abrupt shock).
+
+Return structured JSON ONLY matching this schema:
+{
+  "hook": {
+    "hook_description": "string",
+    "hook_timestamp": "MM:SS",
+    "hook_strength": 0.0-10.0
+  },
+  "cliffhanger": {
+    "cliffhanger_description": "string",
+    "cliffhanger_timestamp": "MM:SS",
+    "cliffhanger_strength": 0.0-10.0,
+    "is_unresolved": true
+  },
+  "one_line_why_it_works": "string"
+}
+
+SCENE CUES WITH TIMESTAMPS:
+"""
+
+# ==============================================================================
+# STAGE 1 & 2: INGESTION & TIMESTAMP PARSER FUNCTIONS
 # ==============================================================================
 
 def extract_episode_id(file_name: str, fallback_idx: int) -> str:
-    patterns = [r"ep(?:isode)?[\s_-]*(\d+)", r"(?:^|[^\d])(\d{1,3})(?:[^\d]|$)"]
+    patterns = [
+        r"ep(?:isode)?[\s_-]*(\d+)",
+        r"(?:^|[^\d])(\d{1,3})(?:[^\d]|$)"
+    ]
     for pattern in patterns:
         match = re.search(pattern, file_name, re.IGNORECASE)
         if match:
@@ -106,9 +173,11 @@ def timestamp_to_seconds(ts_str: str) -> float:
     parts = ts_str.split(":")
     try:
         if len(parts) == 3:
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
         elif len(parts) == 2:
-            return int(parts[0]) * 60 + float(parts[1])
+            m, s = parts
+            return int(m) * 60 + float(s)
         elif len(parts) == 1:
             return float(parts[0])
     except ValueError:
@@ -124,14 +193,26 @@ def classify_line_content(text: str) -> Dict[str, Any]:
     clean_text = text.strip()
     heading_pattern = r"^(?:INT\.|EXT\.|INT/EXT\.|EXT/INT\.|SCENE\s+\d+|CUT\s+TO:)"
     if re.match(heading_pattern, clean_text, re.IGNORECASE):
-        return {"type": "SCENE_HEADING", "character": None, "content": clean_text}
+        return {
+            "type": "SCENE_HEADING",
+            "character": None,
+            "content": clean_text
+        }
     dialogue_match = re.match(r"^([A-Z0-9\s\.\(\)\'\-]+?)\s*:\s*(.*)$", clean_text)
     if dialogue_match and not clean_text.upper().startswith(("NOTE:", "SCENE:", "TIME:")):
         speaker = dialogue_match.group(1).strip()
         speech = dialogue_match.group(2).strip()
         if any(c.isupper() for c in speaker) and len(speaker) <= 30:
-            return {"type": "DIALOGUE", "character": speaker, "content": speech}
-    return {"type": "ACTION", "character": None, "content": clean_text}
+            return {
+                "type": "DIALOGUE",
+                "character": speaker,
+                "content": speech
+            }
+    return {
+        "type": "ACTION",
+        "character": None,
+        "content": clean_text
+    }
 
 def parse_screenplay_to_cues(ep_id: str, raw_text: str) -> List[Dict[str, Any]]:
     ts_regex = re.compile(
@@ -149,7 +230,8 @@ def parse_screenplay_to_cues(ep_id: str, raw_text: str) -> List[Dict[str, Any]]:
             continue
         match = ts_regex.search(line)
         if match:
-            start_str, end_str = match.group(1), match.group(2)
+            start_str = match.group(1)
+            end_str = match.group(2)
             start_s = timestamp_to_seconds(start_str)
             end_s = timestamp_to_seconds(end_str) if end_str else start_s + 3.0
             current_time_s = end_s
@@ -177,6 +259,10 @@ def parse_screenplay_to_cues(ep_id: str, raw_text: str) -> List[Dict[str, Any]]:
             "text": classification["content"]
         })
     return parsed_cues
+
+# ==============================================================================
+# STAGE 3: SCENE SEGMENTATION
+# ==============================================================================
 
 def segment_episode_into_scenes(
     ep_id: str, 
@@ -215,6 +301,8 @@ def segment_episode_into_scenes(
             f"[{c['start_ts']}] {c['character'] + ': ' if c['character'] else ''}{c['text']}"
             for c in group
         ]
+        scene_text = "\n".join(formatted_lines)
+        
         structured_scenes.append({
             "episode_id": ep_id,
             "scene_id": scene_id,
@@ -225,9 +313,13 @@ def segment_episode_into_scenes(
             "duration": round(end_time - start_time, 2),
             "cue_count": len(group),
             "cues": group,
-            "scene_text": "\n".join(formatted_lines)
+            "scene_text": scene_text
         })
     return structured_scenes
+
+# ==============================================================================
+# STAGE 4: AI SCENE EXCITEMENT ANALYZER (AI + FALLBACK)
+# ==============================================================================
 
 def heuristic_semantic_analyzer(scene_text: str) -> Dict[str, Any]:
     text_lower = scene_text.lower()
@@ -269,6 +361,27 @@ def heuristic_semantic_analyzer(scene_text: str) -> Dict[str, Any]:
         "cliffhanger_score": round(cliffhanger_score, 1),
         "standalone_score": 8.0
     }
+
+def analyze_scene_with_ai(scene_text: str, client: Optional[Any] = None) -> Dict[str, Any]:
+    if client:
+        try:
+            full_prompt = SCENE_ANALYSIS_PROMPT + scene_text
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.2
+                )
+            )
+            return json.loads(response.text)
+        except Exception:
+            return heuristic_semantic_analyzer(scene_text)
+    return heuristic_semantic_analyzer(scene_text)
+
+# ==============================================================================
+# STAGE 5: HOOK & CLIFFHANGER DETECTION (AI + FALLBACK)
+# ==============================================================================
 
 def heuristic_hook_cliffhanger_detector(scene: Dict[str, Any]) -> Dict[str, Any]:
     cues = scene.get("cues", [])
@@ -330,6 +443,29 @@ def heuristic_hook_cliffhanger_detector(scene: Dict[str, Any]) -> Dict[str, Any]
         },
         "one_line_why_it_works": f"Opens on immediate tension at {best_hook_cue['start_ts']} and cuts before resolution at {best_cliff_cue['end_ts']}."
     }
+
+def detect_hooks_and_cliffhangers(scene: Dict[str, Any], client: Optional[Any] = None) -> Dict[str, Any]:
+    if client:
+        try:
+            full_prompt = HOOK_CLIFFHANGER_PROMPT + scene["scene_text"]
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.2
+                )
+            )
+            parsed = json.loads(response.text)
+            if "hook" in parsed and "cliffhanger" in parsed:
+                return parsed
+        except Exception:
+            return heuristic_hook_cliffhanger_detector(scene)
+    return heuristic_hook_cliffhanger_detector(scene)
+
+# ==============================================================================
+# STAGE 6: CANDIDATE GENERATOR (20s - 60s)
+# ==============================================================================
 
 def generate_promo_candidates_for_episode(
     ep_id: str,
@@ -476,6 +612,10 @@ def generate_promo_candidates_for_episode(
                     break
     return candidates
 
+# ==============================================================================
+# STAGE 7: SCORING & RANKING
+# ==============================================================================
+
 def compute_duration_suitability(duration: float) -> float:
     if 30.0 <= duration <= 45.0:
         return 10.0
@@ -562,22 +702,54 @@ def score_and_rank_candidates(
         item["promo_id"] = f"PROMO_{rank_idx:03d}"
     return scored_list
 
+# ==============================================================================
+# STAGE 8: OUTPUT STRUCTURING
+# ==============================================================================
+
+def audit_quality_flags(promo: Dict[str, Any]) -> List[str]:
+    flags = []
+    duration = promo["duration"]
+    if duration < 20.0:
+        flags.append("DURATION_TOO_SHORT (<20s)")
+    elif duration > 60.0:
+        flags.append("DURATION_TOO_LONG (>60s)")
+    elif 20.0 <= duration < 24.0:
+        flags.append("BORDERLINE_SHORT: Minimal narrative setup")
+    elif 56.0 < duration <= 60.0:
+        flags.append("BORDERLINE_LONG: Potential viewer drop-off risk")
+
+    hook_sec = timestamp_to_seconds(promo["hook"]["timestamp"])
+    start_sec = promo["start_s"]
+    hook_delay = hook_sec - start_sec
+    if hook_delay > 3.0:
+        flags.append(f"SLOW_HOOK: Hook occurs {hook_delay:.1f}s after promo start")
+
+    if promo["hook"]["strength"] < 7.0:
+        flags.append("WEAK_HOOK: Hook intensity score below 7.0")
+    if promo["cliffhanger"]["strength"] < 7.0:
+        flags.append("WEAK_CLIFFHANGER: Tension cutoff unresolved score below 7.0")
+    return flags
+
 def format_final_promos(ranked_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     final_outputs = []
     for item in ranked_candidates:
         promo_id = item.get("promo_id", f"PROMO_{item['rank']:03d}")
-        segments = [
-            {
-                "start_time": s.get("start_ts", seconds_to_timestamp(s["start_s"])),
-                "end_time": s.get("end_ts", seconds_to_timestamp(s["end_s"]))
-            }
-            for s in item.get("segments", [{
-                "start_s": item["start_s"], 
-                "end_s": item["end_s"],
-                "start_ts": item["start_ts"],
-                "end_ts": item["end_ts"]
-            }])
-        ]
+        quality_flags = audit_quality_flags(item)
+
+        default_segments = [{
+            "start_ts": item.get("start_ts", seconds_to_timestamp(item["start_s"])),
+            "end_ts": item.get("end_ts", seconds_to_timestamp(item["end_s"]))
+        }]
+
+        segments = []
+        for s in item.get("segments", default_segments):
+            start_time = s.get("start_ts") or (seconds_to_timestamp(s["start_s"]) if "start_s" in s else "00:00")
+            end_time = s.get("end_ts") or (seconds_to_timestamp(s["end_s"]) if "end_s" in s else "00:00")
+            segments.append({
+                "start_time": start_time,
+                "end_time": end_time
+            })
+
         structured_record = {
             "rank": item["rank"],
             "promo_id": promo_id,
@@ -590,10 +762,15 @@ def format_final_promos(ranked_candidates: List[Dict[str, Any]]) -> List[Dict[st
             "cliffhanger_timestamp": item["cliffhanger"]["timestamp"],
             "score": item["final_score"],
             "why_it_works": item["one_line_why_it_works"],
-            "score_breakdown": item["score_breakdown"]
+            "score_breakdown": item["score_breakdown"],
+            "quality_flags": quality_flags
         }
         final_outputs.append(structured_record)
     return final_outputs
+
+# ==============================================================================
+# STAGE 9: QUALITY EVALUATION & FAILURE AUDIT
+# ==============================================================================
 
 def calculate_time_overlap(p1_start: float, p1_end: float, p2_start: float, p2_end: float) -> float:
     inter_start = max(p1_start, p2_start)
@@ -689,39 +866,72 @@ def run_automated_quality_audit(
         "details": audit_results
     }
 
-def execute_complete_colab_pipeline(episodes_dict: Dict[str, str], custom_weights: Dict[str, float] = None):
+# ==============================================================================
+# PIPELINE COORDINATOR
+# ==============================================================================
+
+def execute_complete_colab_pipeline(
+    episodes_dict: Dict[str, str], 
+    custom_weights: Dict[str, float] = None,
+    api_key: str = ""
+):
+    ai_client = genai.Client(api_key=api_key) if api_key and HAS_GENAI else None
+
+    # Stage 2: Parse
     parsed_episodes = {ep_id: parse_screenplay_to_cues(ep_id, text) for ep_id, text in episodes_dict.items()}
+    
+    # Stage 3: Segment
     all_scenes = {ep_id: segment_episode_into_scenes(ep_id, cues) for ep_id, cues in parsed_episodes.items()}
     flat_scene_list = [sc for scs in all_scenes.values() for sc in scs]
     
+    # Stage 4: AI Analysis
     for sc in flat_scene_list:
-        sc["ai_analysis"] = heuristic_semantic_analyzer(sc["scene_text"])
-        sc["promo_moments"] = heuristic_hook_cliffhanger_detector(sc)
+        sc["ai_analysis"] = analyze_scene_with_ai(sc["scene_text"], client=ai_client)
         
+    # Stage 5: Hook & Cliffhanger Detection
+    for sc in flat_scene_list:
+        sc["promo_moments"] = detect_hooks_and_cliffhangers(sc, client=ai_client)
+        
+    # Stage 6: Candidate Generator (20s - 60s)
     all_candidates = []
     for ep_id, scenes in all_scenes.items():
         cues = parsed_episodes.get(ep_id, [])
         ep_candidates = generate_promo_candidates_for_episode(ep_id, scenes, cues)
         all_candidates.extend(ep_candidates)
         
+    # Stage 7: Score & Rank
     ranked_promos = score_and_rank_candidates(all_candidates, all_scenes, custom_weights)
+    
+    # Stage 8: Output Structuring
     final_promos = format_final_promos(ranked_promos)
+    
+    # Stage 9: Quality Audit
     audit_report = run_automated_quality_audit(final_promos)
     
     return final_promos, all_scenes, len(flat_scene_list), audit_report
 
 # ==============================================================================
-# STREAMLIT UI
+# STREAMLIT UI LAYOUT
 # ==============================================================================
 
 st.markdown("""
 <div class="hero-header">
     <div class="hero-title">🎬 Kuku PromoAI Dashboard</div>
-    <div class="hero-sub">Exact Stage 1–9 Colab Pipeline Engine: Ad extraction, hook/cliffhanger detection, and ranking.</div>
+    <div class="hero-sub">Direct Execution of Stages 1–9 from <code>main.ipynb</code>: Ad extraction, hook/cliffhanger detection, and ranking.</div>
 </div>
 """, unsafe_allow_html=True)
 
+# Sidebar: API Key & Scoring Weights
 with st.sidebar:
+    st.header("🔑 Model Settings")
+    api_key_input = st.text_input(
+        "Gemini API Key (Optional)",
+        type="password",
+        placeholder="AIzaSy...",
+        help="Paste your Gemini API key to run Gemini 2.5 Flash, or leave blank to use the deterministic fallback."
+    )
+    
+    st.markdown("---")
     st.header("⚙️ Stage 7 Formula Weights")
     w_hook = st.slider("Hook (H)", 0.0, 1.0, 0.25, 0.05)
     w_cliff = st.slider("Cliffhanger (C)", 0.0, 1.0, 0.25, 0.05)
@@ -736,6 +946,7 @@ with st.sidebar:
     }
     min_score_filter = st.slider("Filter: Min Final Score", 0.0, 10.0, 7.0, 0.1)
 
+# Tab Navigation: The 7 Core Features
 tab_run, tab_summary, tab_promos, tab_episodes, tab_audit, tab_export = st.tabs([
     "📥 Ingest & Run", "📊 Summary", "🏆 Ranked Promos", 
     "🔍 Episode Explorer", "🛡️ Quality Audit", "💾 Export Deliverables"
@@ -752,6 +963,7 @@ if "total_scenes_count" not in st.session_state:
 if "audit_report" not in st.session_state:
     st.session_state.audit_report = {}
 
+# --- SECTION 1 & 2: Upload Screenplays & Run Full Pipeline ---
 with tab_run:
     c_up, c_dem = st.columns([2, 1])
     with c_up:
@@ -786,10 +998,14 @@ with tab_run:
     st.subheader("2. Run Pipeline (Stages 2 -> 9)")
     if st.session_state.episodes_data:
         st.info(f"Loaded {len(st.session_state.episodes_data)} episodes ready for analysis.")
+        active_key = api_key_input.strip() if api_key_input else os.getenv("GEMINI_API_KEY", "")
+        mode_label = "Gemini Flash API Mode" if active_key else "Deterministic Semantic Fallback Mode"
+        st.caption(f"Active Engine: **{mode_label}**")
+
         if st.button("🚀 Execute Full Pipeline", type="primary", use_container_width=True):
-            with st.spinner("Executing Stages 2 to 9 identically to Colab..."):
+            with st.spinner("Executing Stages 2 to 9 identically to main.ipynb..."):
                 final_promos, all_scenes, total_scenes, audit_report = execute_complete_colab_pipeline(
-                    st.session_state.episodes_data, current_weights
+                    st.session_state.episodes_data, current_weights, api_key=active_key
                 )
                 st.session_state.promos_results = final_promos
                 st.session_state.all_scenes = all_scenes
@@ -801,6 +1017,7 @@ with tab_run:
 
 has_results = len(st.session_state.promos_results) > 0
 
+# --- SECTION 3: Summary Dashboard ---
 with tab_summary:
     if has_results:
         promos = st.session_state.promos_results
@@ -827,6 +1044,7 @@ with tab_summary:
     else:
         st.info("Run the pipeline in the first tab to view summary metrics.")
 
+# --- SECTION 4: Ranked Promos ---
 with tab_promos:
     if has_results:
         filtered = [p for p in st.session_state.promos_results if p["score"] >= min_score_filter]
@@ -858,6 +1076,7 @@ with tab_promos:
     else:
         st.info("Run the pipeline in the first tab to view ranked promos.")
 
+# --- SECTION 5: Episode-wise Analysis ---
 with tab_episodes:
     if has_results:
         ep_list = sorted(list(st.session_state.all_scenes.keys()))
@@ -872,8 +1091,9 @@ with tab_episodes:
             for sc in scenes_for_ep:
                 with st.expander(f"Scene {sc['scene_id']} ({sc['start_ts']} - {sc['end_ts']} · {sc['duration']}s)"):
                     st.text(sc["scene_text"])
-                    st.caption(f"Hook: {sc['promo_moments']['hook']['hook_description']}")
-                    st.caption(f"Cliffhanger: {sc['promo_moments']['cliffhanger']['cliffhanger_description']}")
+                    if "promo_moments" in sc:
+                        st.caption(f"Hook: {sc['promo_moments']['hook']['hook_description']}")
+                        st.caption(f"Cliffhanger: {sc['promo_moments']['cliffhanger']['cliffhanger_description']}")
         with c_pr:
             st.markdown(f"#### 🎯 Promos in {selected_ep} ({len(promos_for_ep)})")
             for pr in promos_for_ep:
@@ -881,6 +1101,7 @@ with tab_episodes:
     else:
         st.info("Execute pipeline to inspect episode scenes.")
 
+# --- SECTION 6: Quality Evaluation ---
 with tab_audit:
     if has_results:
         audit = st.session_state.audit_report
@@ -897,6 +1118,7 @@ with tab_audit:
     else:
         st.info("Execute pipeline to inspect quality diagnostics.")
 
+# --- SECTION 7: Download Results ---
 with tab_export:
     if has_results:
         st.subheader("💾 Export Deliverables")
